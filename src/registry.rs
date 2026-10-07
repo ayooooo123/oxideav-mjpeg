@@ -317,6 +317,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id,
         tables,
         pending: None,
+        last_output: None,
         eof: false,
     }))
 }
@@ -326,6 +327,9 @@ struct MjpegDecoder {
     /// §B.5 tables-only stream shared by every packet (`extradata`).
     tables: Option<Vec<u8>>,
     pending: Option<Packet>,
+    /// Size and layout of the image `receive_frame` last returned
+    /// (images are decoded there, so none is known before it).
+    last_output: Option<(u32, u32, PixelFormat)>,
     eof: bool,
 }
 
@@ -361,9 +365,20 @@ impl Decoder for MjpegDecoder {
             opts = opts.with_tables(t.clone());
         }
         let img = crate::decode_with(&pkt.data, &opts)?;
+        self.last_output = Some((img.width, img.height, PixelFormat::from(img.format)));
         let mut vf = VideoFrame::from(img);
         vf.pts = pkt.pts;
         Ok(Frame::Video(vf))
+    }
+
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.last_output
+            .map(|(w, h, _)| (w, h))
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.last_output.map(|(_, _, format)| format)
     }
 
     fn flush(&mut self) -> Result<()> {

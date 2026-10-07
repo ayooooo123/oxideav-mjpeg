@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The registry decoder implements `Decoder::output_video_dimensions` /
+  `output_pixel_format`: the size and pixel format of the image
+  `receive_frame` last returned.
+
 ### Fixed
 
 - **The `jpeg` and `mjpeg-raw` demuxers declare what the decoder
