@@ -66,7 +66,7 @@ use crate::jpeg::huffman::{
     STD_AC_LUMA_VALS, STD_DC_CHROMA_BITS, STD_DC_CHROMA_VALS, STD_DC_LUMA_BITS, STD_DC_LUMA_VALS,
 };
 use crate::jpeg::markers;
-use crate::jpeg::quant::{scale_for_quality, DEFAULT_CHROMA_Q50, DEFAULT_LUMA_Q50};
+use crate::jpeg::quant::{scale_for_quality, QuantTable, DEFAULT_CHROMA_Q50, DEFAULT_LUMA_Q50};
 use crate::jpeg::zigzag::ZIGZAG;
 
 /// Quality factor 1..=100, scaled against the Annex K Q=50 base tables.
@@ -7230,10 +7230,18 @@ fn hier_emit_block_huff(
     }
 }
 
-/// Dequantise + inverse-transform one quantised block with the exact
-/// arithmetic the decode path uses (`f32` multiply, shared [`idct8x8`]),
-/// so the encoder's mirrored reference matches the decoder's bit-for-bit.
-fn hier_dct_recon_block(q: &[i32; 64], quant: &[u16; 64]) -> [f32; 64] {
+/// Dequantise + inverse-transform one quantised block exactly as the
+/// decode path does, so the encoder's mirrored reference matches the
+/// decoder's bit-for-bit: a non-differential (8-bit) block through the
+/// decoder's own render (FFmpeg's integer IDCT, level-shifted back down
+/// so the caller's fold returns its pixels), a differential one with the
+/// `f32` multiply and the shared [`idct8x8`].
+fn hier_dct_recon_block(q: &[i32; 64], quant: &[u16; 64], differential: bool) -> [f32; 64] {
+    if !differential {
+        let mut px = [0u8; 64];
+        crate::decoder::render_block_8bit(q, &QuantTable { values: *quant }, &mut px, 8, 0, 0);
+        return std::array::from_fn(|i| f32::from(px[i]) - 128.0);
+    }
     let mut blk = [0.0f32; 64];
     for k in 0..64 {
         blk[k] = q[k] as f32 * quant[k] as f32;
@@ -7302,7 +7310,7 @@ fn hier_encode_dct_frame_huff(
                         dc_huff,
                         ac_huff,
                     );
-                    let r = hier_dct_recon_block(&q, quant);
+                    let r = hier_dct_recon_block(&q, quant, differential);
                     for j in 0..8 {
                         for i in 0..8 {
                             recon_padded[ci][(my * 8 + j) * comp_w + mx * 8 + i] = r[j * 8 + i];
@@ -7671,7 +7679,7 @@ fn hier_encode_dct_frame_arith(
                     dc_stats[ci].pred = 0;
                 }
                 arith_encode_block(&mut enc, &mut dc_stats[ci], &mut ac_stats[ci], &zz);
-                let r = hier_dct_recon_block(&q, quant);
+                let r = hier_dct_recon_block(&q, quant, differential);
                 for j in 0..8 {
                     for i in 0..8 {
                         recon_padded[ci][(my * 8 + j) * comp_w + mx * 8 + i] = r[j * 8 + i];
@@ -7935,7 +7943,7 @@ fn hier_recon_from_blocks(
         for (bi, q) in blocks[ci].iter().enumerate() {
             let bx = bi % blocks_x;
             let by = bi / blocks_x;
-            let r = hier_dct_recon_block(q, quant);
+            let r = hier_dct_recon_block(q, quant, differential);
             for j in 0..8 {
                 let y = by * 8 + j;
                 if y >= h {

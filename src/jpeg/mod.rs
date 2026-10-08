@@ -15,5 +15,7 @@ pub mod markers;
 pub mod parser;
 #[doc(hidden)]
 pub mod quant;
+/// FFmpeg's C simple IDCT (LGPL-2.1-or-later, see the file's notice).
+pub mod simple_idct;
 #[doc(hidden)]
 pub mod zigzag;

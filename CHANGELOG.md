@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (PearTube fork)
+
+- Decoded frames equal FFmpeg 2da55bf's (`-idct simple`), frame for frame,
+  on Motion-JPEG in AVI and MOV (4:2:0, 4:2:2, 4:4:4, interlaced fields).
+  The crate is now `MIT AND LGPL-2.1-or-later` (LGPL ports marked in their
+  files):
+  - 8-bit blocks are dequantised in integers and reconstructed with
+    FFmpeg's C simple IDCT (`src/jpeg/simple_idct.rs`, a port of
+    `simple_idct_template.c`), with the DC carrying the level shift as
+    FFmpeg's DC predictor does; hierarchical 8-bit base frames and the
+    encoder's reconstruction follow it.
+  - Sampling factors that are all even are halved first (FFmpeg's
+    `pix_fmt_id` normalisation), so 2x2 luma over 1x2 chroma (FFmpeg's own
+    4:2:2 coding) decodes as `YuvJ422P`, not upsampled 4:4:4.
+  - The decoder starts with the Annex K Huffman tables, as FFmpeg's
+    `init_default_huffman_tables` does: Motion-JPEG without DHT segments
+    decodes.
+  - The registry claims FFmpeg's MJPEG FourCCs and QuickTime sample-entry
+    codes (`jpeg`, `mjpa`, `AVI1`, `AVRn`, …).
+  - A picture of two fields (an image under 3/4 of the container height)
+    is woven into one frame, bottom field first for `MJPG` as FFmpeg
+    defaults.
+
 ### Added
 
 - The registry decoder implements `Decoder::output_video_dimensions` /

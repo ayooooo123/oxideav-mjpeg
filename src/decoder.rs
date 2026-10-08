@@ -29,6 +29,7 @@ use crate::jpeg::parser::{
     parse_dac, parse_dnl, parse_dri, parse_sof, parse_sos, MarkerWalker, SofInfo, SosInfo,
 };
 use crate::jpeg::quant::{parse_dqt, QuantTable};
+use crate::jpeg::simple_idct::simple_idct_put;
 use crate::jpeg::zigzag::ZIGZAG;
 
 // ---- Decoding state ------------------------------------------------------
@@ -92,12 +93,35 @@ struct ArithAcConditioning {
     pub kx: u8,
 }
 
+/// The Annex K tables FFmpeg's decoder starts with (2da55bf mjpegdec.c
+/// `init_default_huffman_tables`): DC and AC tables 0 (luma) and 1
+/// (chroma). A DHT segment replaces them; Motion-JPEG from many cameras
+/// and capture cards (AVI1) carries none and relies on these.
+static DEFAULT_HUFFMAN: std::sync::LazyLock<[[Option<HuffTable>; 4]; 2]> =
+    std::sync::LazyLock::new(|| {
+        use crate::jpeg::huffman::*;
+        [
+            [
+                HuffTable::build(&STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS).ok(),
+                HuffTable::build(&STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS).ok(),
+                None,
+                None,
+            ],
+            [
+                HuffTable::build(&STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS).ok(),
+                HuffTable::build(&STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS).ok(),
+                None,
+                None,
+            ],
+        ]
+    });
+
 impl JpegState {
     fn new() -> Self {
         Self {
             quant: Default::default(),
-            dc_huff: Default::default(),
-            ac_huff: Default::default(),
+            dc_huff: DEFAULT_HUFFMAN[0].clone(),
+            ac_huff: DEFAULT_HUFFMAN[1].clone(),
             restart_interval: 0,
             sof: None,
             progressive: false,
@@ -1186,53 +1210,33 @@ fn extend(value: i32, size: u32) -> i32 {
     }
 }
 
-/// Convert a quant table to f32 once per scan so the per-block dequantise
-/// loop skips the u16 → f32 conversion. The conversion is exact (every u16
-/// is representable in f32), so hoisting it cannot change any product.
-fn quant_to_f32(qt: &QuantTable) -> [f32; 64] {
-    std::array::from_fn(|k| qt.values[k] as f32)
-}
-
 /// Dequantise one natural-order coefficient block, inverse-DCT it, and
-/// store the level-shifted clamped 8-bit samples into `buf` at
-/// `(dst_x0, dst_y0)`. Shared by the interleaved sequential path
-/// (`decode_scan`) and the coefficient-accumulator render
-/// (`render_from_coefs`).
+/// store the clamped 8-bit samples into `buf` at `(dst_x0, dst_y0)`.
+/// Shared by the interleaved sequential path (`decode_scan`) and the
+/// coefficient-accumulator render (`render_from_coefs`).
 ///
-/// The arithmetic is exactly the historical inline sequence — dequantise
-/// in f32 (avoids i32 overflow when a Pq=1 16-bit quantiser meets a
-/// coefficient at the top of its range), `idct8x8`, `+ 128.0` level shift,
-/// `<= 0.0` / `>= 255.0` clamp, `round()` — so the output is bit-identical;
-/// the store loop walks 8-sample row slices so the bounds check runs once
-/// per row instead of once per sample.
+/// The arithmetic is FFmpeg's (2da55bf `mjpegdec.c` `decode_block` and the
+/// C simple IDCT `-idct simple` selects), so the samples equal its output:
+/// the coefficients are dequantised in integers and stored as `int16_t`;
+/// the DC carries the level shift as FFmpeg's DC predictor does, starting
+/// at `4 << 8` (1024 at the transform's scale, 128 after it), clipped to
+/// int16.
 #[inline]
-fn render_block_8bit(
+pub(crate) fn render_block_8bit(
     block: &[i32; 64],
-    qtf: &[f32; 64],
+    qt: &QuantTable,
     buf: &mut [u8],
     stride: usize,
     dst_x0: usize,
     dst_y0: usize,
 ) {
-    let mut fblock = [0.0f32; 64];
-    for k in 0..64 {
-        fblock[k] = block[k] as f32 * qtf[k];
+    let mut coefs = [0i16; 64];
+    let dc = i64::from(block[0]) * i64::from(qt.values[0]) + 1024;
+    coefs[0] = dc.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+    for k in 1..64 {
+        coefs[k] = block[k].wrapping_mul(i32::from(qt.values[k])) as i16;
     }
-    idct8x8(&mut fblock);
-    for j in 0..8 {
-        let dst = &mut buf[(dst_y0 + j) * stride + dst_x0..][..8];
-        let src = &fblock[j * 8..j * 8 + 8];
-        for (out, &f) in dst.iter_mut().zip(src) {
-            let v = f + 128.0;
-            *out = if v <= 0.0 {
-                0
-            } else if v >= 255.0 {
-                255
-            } else {
-                v.round() as u8
-            };
-        }
-    }
+    simple_idct_put(&mut coefs, &mut buf[dst_y0 * stride + dst_x0..], stride);
 }
 
 fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImage> {
@@ -1351,8 +1355,6 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
                 .ok_or_else(|| Error::invalid("quant table missing for component"))
         })
         .collect::<Result<Vec<_>>>()?;
-    // Per-component quantisers in f32, converted once for the whole scan.
-    let quant_f32: Vec<[f32; 64]> = quant_tables.iter().map(|qt| quant_to_f32(qt)).collect();
 
     let mut br = BitReader::new(scan);
     let mut prev_dc = vec![0i32; n_comp];
@@ -1426,7 +1428,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
                         let dst_y0 = my * 8 * c.v_factor as usize + by * 8;
                         render_block_8bit(
                             &block,
-                            &quant_f32[*sof_idx],
+                            quant_tables[*sof_idx],
                             &mut comp_buf[*sof_idx],
                             comp_stride[*sof_idx],
                             dst_x0,
@@ -1532,16 +1534,30 @@ impl YuvLayout {
 }
 
 /// Classify the sampling layout of a three-component (non-RGB) frame.
+///
+/// As FFmpeg's `ff_mjpeg_decode_sof` does (2da55bf mjpegdec.c, LGPL), the
+/// factors are first reduced: when every horizontal factor is even they are
+/// all halved, and likewise vertically. So `2×2` luma over `1×2` chroma, a
+/// 4:2:2 coding some cameras use, is the `2×1` / `1×1` layout: native
+/// 4:2:2, not 4:4:4.
 fn yuv_layout(sof: &SofInfo, width: usize, height: usize, twelve_bit: bool) -> YuvLayout {
-    let y = sof.components[0];
-    let cb = sof.components[1];
-    let cr = sof.components[2];
-    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1);
-    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1);
-    let chroma_unit = cb.h_factor == 1 && cb.v_factor == 1 && cr.h_factor == 1 && cr.v_factor == 1;
-    let luma_max = y.h_factor == h_max && y.v_factor == v_max;
+    let hs: Vec<u8> = sof.components.iter().map(|c| c.h_factor).collect();
+    let vs: Vec<u8> = sof.components.iter().map(|c| c.v_factor).collect();
+    let halve = |f: &[u8]| -> Vec<u8> {
+        if f.iter().all(|&x| x % 2 == 0) {
+            f.iter().map(|&x| x / 2).collect()
+        } else {
+            f.to_vec()
+        }
+    };
+    let (hs, vs) = (halve(&hs), halve(&vs));
+    let (y, cb, cr) = ((hs[0], vs[0]), (hs[1], vs[1]), (hs[2], vs[2]));
+    let h_max = hs.iter().copied().max().unwrap_or(1);
+    let v_max = vs.iter().copied().max().unwrap_or(1);
+    let chroma_unit = cb == (1, 1) && cr == (1, 1);
+    let luma_max = y == (h_max, v_max);
     let native = if chroma_unit && luma_max {
-        match (y.h_factor, y.v_factor, twelve_bit) {
+        match (y.0, y.1, twelve_bit) {
             (1, 1, false) => Some(PixelFormat::Yuv444P),
             (2, 1, false) => Some(PixelFormat::Yuv422P),
             (2, 2, false) => Some(PixelFormat::Yuv420P),
@@ -2882,13 +2898,13 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
     for (ci, c) in sof.components.iter().enumerate() {
         let blocks_x = mcus_x * c.h_factor as usize;
         let blocks_y = mcus_y * c.v_factor as usize;
-        let qtf = quant_to_f32(quant_tables[ci]);
+        let qt = quant_tables[ci];
         let stride = comp_stride[ci];
         let buf = &mut comp_buf[ci];
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
                 let block = &coefs[ci][by * blocks_x + bx];
-                render_block_8bit(block, &qtf, buf, stride, bx * 8, by * 8);
+                render_block_8bit(block, qt, buf, stride, bx * 8, by * 8);
             }
         }
     }
@@ -4793,13 +4809,25 @@ fn decode_hierarchical_dct_frame_inner(
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
                 let block = &coefs[ci][by * blocks_x + bx];
+                let dst_x0 = bx * 8;
+                let dst_y0 = by * 8;
+                if !differential && precision == 8 {
+                    // The same reconstruction as a baseline 8-bit frame, so
+                    // a single-stage hierarchical frame decodes to its pixels.
+                    let mut px = [0u8; 64];
+                    render_block_8bit(block, qt, &mut px, 8, 0, 0);
+                    for j in 0..8 {
+                        for i in 0..8 {
+                            full[(dst_y0 + j) * comp_w + dst_x0 + i] = u32::from(px[j * 8 + i]);
+                        }
+                    }
+                    continue;
+                }
                 let mut fblock = [0.0f32; 64];
                 for k in 0..64 {
                     fblock[k] = block[k] as f32 * qt.values[k] as f32;
                 }
                 idct8x8(&mut fblock);
-                let dst_x0 = bx * 8;
-                let dst_y0 = by * 8;
                 for j in 0..8 {
                     for i in 0..8 {
                         let v = fblock[j * 8 + i] + level_shift;
@@ -7082,9 +7110,10 @@ mod lossless_tests {
 
 #[cfg(test)]
 mod sof10_tests {
-    use super::decode_planes;
+    use super::{decode_planes, render_block_8bit};
     use crate::jpeg::arith::{encode_magnitude, AcStats, ArithEncoder, Context, DcStats};
     use crate::jpeg::dct::idct8x8;
+    use crate::jpeg::quant::QuantTable;
     use crate::jpeg::zigzag::ZIGZAG;
 
     /// Append one length-prefixed marker segment (T.81 §B.1.1.4).
@@ -7451,6 +7480,19 @@ mod sof10_tests {
         out
     }
 
+    /// One 8-bit block as the decoder renders it (`render_block_8bit`):
+    /// identity dequantise, FFmpeg's integer IDCT with the DC level shift.
+    /// `vals` are in zigzag order.
+    fn reference_block_8(vals: &[i32; 64]) -> [u8; 64] {
+        let mut nat = [0i32; 64];
+        for k in 0..64 {
+            nat[ZIGZAG[k]] = vals[k];
+        }
+        let mut px = [0u8; 64];
+        render_block_8bit(&nat, &QuantTable { values: [1; 64] }, &mut px, 8, 0, 0);
+        px
+    }
+
     /// Reference render: identity dequantise + IDCT + level shift, exactly
     /// as `render_from_coefs` does for an 8-bit component, cropped to
     /// (w, h).
@@ -7459,25 +7501,11 @@ mod sof10_tests {
         let blocks_y = blocks.len() / blocks_x;
         let mut full = vec![0u8; bw * blocks_y * 8];
         for (bi, vals) in blocks.iter().enumerate() {
-            let mut nat = [0.0f32; 64];
-            for k in 0..64 {
-                nat[ZIGZAG[k]] = vals[k] as f32;
-            }
-            idct8x8(&mut nat);
+            let px = reference_block_8(vals);
             let bx = bi % blocks_x;
             let by = bi / blocks_x;
             for j in 0..8 {
-                for i in 0..8 {
-                    let v = nat[j * 8 + i] + 128.0;
-                    let px = if v <= 0.0 {
-                        0
-                    } else if v >= 255.0 {
-                        255
-                    } else {
-                        v.round() as u8
-                    };
-                    full[(by * 8 + j) * bw + bx * 8 + i] = px;
-                }
+                full[(by * 8 + j) * bw + bx * 8..][..8].copy_from_slice(&px[j * 8..j * 8 + 8]);
             }
         }
         let mut out = vec![0u8; w * h];
@@ -7968,22 +7996,10 @@ mod sof10_tests {
             // Re-expand base into the full grid as u32 references.
             let bx = bi % blocks_x;
             let by = bi / blocks_x;
-            let mut nat = [0.0f32; 64];
-            for k in 0..64 {
-                nat[ZIGZAG[k]] = b[k] as f32;
-            }
-            idct8x8(&mut nat);
+            let px = reference_block_8(b);
             for j in 0..8 {
                 for i in 0..8 {
-                    let v = nat[j * 8 + i] + 128.0;
-                    let px = if v <= 0.0 {
-                        0
-                    } else if v >= 255.0 {
-                        255
-                    } else {
-                        v.round() as u32
-                    };
-                    full[(by * 8 + j) * bw + bx * 8 + i] = px;
+                    full[(by * 8 + j) * bw + bx * 8 + i] = u32::from(px[j * 8 + i]);
                 }
             }
         }
@@ -8038,22 +8054,10 @@ mod sof10_tests {
         for (bi, b) in base.iter().enumerate() {
             let bx = bi % blocks_x;
             let by = bi / blocks_x;
-            let mut nat = [0.0f32; 64];
-            for k in 0..64 {
-                nat[ZIGZAG[k]] = b[k] as f32;
-            }
-            idct8x8(&mut nat);
+            let px = reference_block_8(b);
             for j in 0..8 {
                 for i in 0..8 {
-                    let val = nat[j * 8 + i] + 128.0;
-                    let px = if val <= 0.0 {
-                        0
-                    } else if val >= 255.0 {
-                        255
-                    } else {
-                        val.round() as u32
-                    };
-                    full[(by * 8 + j) * bw + bx * 8 + i] = px;
+                    full[(by * 8 + j) * bw + bx * 8 + i] = u32::from(px[j * 8 + i]);
                 }
             }
         }

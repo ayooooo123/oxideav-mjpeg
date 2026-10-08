@@ -169,13 +169,11 @@ fn abbreviated_frames_decode_with_extradata_tables() {
             assert_eq!(typical_tables, tables, "{pix:?}");
         }
         for data in [&a, &b] {
+            // Table-less: no DHT. (Decoding it alone may still succeed: the
+            // decoder starts from the Annex K tables, as FFmpeg's does.)
             assert!(
                 !data.windows(2).any(|m| m == [0xFF, 0xC4]),
                 "{pix:?}: frame carries DHT"
-            );
-            assert!(
-                oxideav_mjpeg::decode(data).is_err(),
-                "{pix:?}: table-less frame must not decode alone"
             );
             let via_fn =
                 oxideav_mjpeg::decode_with(data, &DecodeOptions::new().with_tables(tables.clone()))

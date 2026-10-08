@@ -17,13 +17,26 @@
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::LazyLock;
 
 use oxideav_core::{ContainerRegistry, NullCodecResolver, ReadSeek};
 
-/// Generate the 10-frame raw MJPEG fixture under `OUT_DIR/testsrc_10frames.mjpeg`
-/// and return its absolute path. Returns `None` when ffmpeg is missing.
+/// The fixture, made once for all the tests of this binary: they run in
+/// parallel, and each regenerating the same file raced FFmpeg's write
+/// against another test's read.
+static FIXTURE: LazyLock<Option<PathBuf>> = LazyLock::new(make_fixture);
+
 fn generate_fixture() -> Option<PathBuf> {
-    let out = std::env::temp_dir().join("oxideav_mjpeg_seek_testsrc_10frames.mjpeg");
+    FIXTURE.clone()
+}
+
+/// Generate the 10-frame raw MJPEG fixture in the temp directory and
+/// return its absolute path. Returns `None` when ffmpeg is missing.
+fn make_fixture() -> Option<PathBuf> {
+    let out = std::env::temp_dir().join(format!(
+        "oxideav_mjpeg_seek_testsrc_10frames_{}.mjpeg",
+        std::process::id()
+    ));
     // Always regenerate so a stale half-written file from a previous
     // run can't make the seek tests flaky.
     let _ = std::fs::remove_file(&out);

@@ -1267,7 +1267,8 @@ mod tests {
         let refs: Vec<&[u16]> = prepared.planes.iter().map(|p| p.as_slice()).collect();
         let enc = prepared.opts.encode(8, 8, &refs).unwrap();
         let tables = enc.tables.expect("abbreviated pair");
-        assert!(decode(&enc.data).is_err());
+        // Table-less: no DHT in the frame; the tables stream carries them.
+        assert!(!enc.data.windows(2).any(|m| m == [0xFF, 0xC4]));
         let back = decode_with(&enc.data, &DecodeOptions::new().with_tables(tables)).unwrap();
         assert_eq!(back.format, F::Rgb24);
         assert_eq!(back.planes, img.planes);

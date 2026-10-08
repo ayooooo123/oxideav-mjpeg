@@ -5,8 +5,9 @@
 //!
 //! `decoded_format/*.jpg` are single FFmpeg `mjpeg` frames of `testsrc`.
 //! FFmpeg codes its 4:2:2 picture as 2×2 luma with 1×2 chroma, and its
-//! 4:4:4 picture as 1×2 on every component. This decoder keeps only 1×1
-//! chroma as a native layout and upsamples those two to 4:4:4.
+//! 4:4:4 picture as 1×2 on every component. As FFmpeg does, the decoder
+//! halves factors that are all even, so those decode as `yuvj422p` and
+//! `yuvj444p`, FFmpeg's formats for them.
 
 #![cfg(feature = "registry")]
 
@@ -24,7 +25,7 @@ fn each_frame_reports_its_own_size_and_layout() {
         ),
         (
             include_bytes!("decoded_format/b_422_34x19.jpg"),
-            (34, 19, PixelFormat::YuvJ444P),
+            (34, 19, PixelFormat::YuvJ422P),
         ),
         (
             include_bytes!("decoded_format/c_444_35x18.jpg"),

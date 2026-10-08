@@ -269,11 +269,35 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .encoder(make_encoder)
             .encoder_options::<MjpegEncoderOptions>()
             .tags([
-                // AVI FourCC claims — all unambiguous MJPEG variants.
+                // The AVI FourCCs and QuickTime sample-entry codes FFmpeg
+                // 2da55bf maps to its MJPEG decoder (libavformat/riff.c
+                // ff_codec_bmp_tags, isom_tags.c ff_codec_movvideo_tags):
+                // QuickTime Photo-JPEG `jpeg` and Motion-JPEG A `mjpa`
+                // among them.
                 CodecTag::fourcc(b"MJPG"),
                 CodecTag::fourcc(b"AVRN"),
                 CodecTag::fourcc(b"LJPG"),
                 CodecTag::fourcc(b"JPGL"),
+                CodecTag::fourcc(b"ACDV"),
+                CodecTag::fourcc(b"AVDJ"),
+                CodecTag::fourcc(b"AVI1"),
+                CodecTag::fourcc(b"AVI2"),
+                CodecTag::fourcc(b"AVRn"),
+                CodecTag::fourcc(b"CJPG"),
+                CodecTag::fourcc(b"IJLV"),
+                CodecTag::fourcc(b"IJPG"),
+                CodecTag::fourcc(b"JR24"),
+                CodecTag::fourcc(b"MJLS"),
+                CodecTag::fourcc(b"MMJP"),
+                CodecTag::fourcc(b"MSC2"),
+                CodecTag::fourcc(b"MTSJ"),
+                CodecTag::fourcc(b"MVJP"),
+                CodecTag::fourcc(b"QIVG"),
+                CodecTag::fourcc(b"SLMJ"),
+                CodecTag::fourcc(b"ZJPG"),
+                CodecTag::fourcc(b"dmb1"),
+                CodecTag::fourcc(b"jpeg"),
+                CodecTag::fourcc(b"mjpa"),
             ]),
     );
 }
@@ -316,6 +340,10 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(MjpegDecoder {
         codec_id,
         tables,
+        container_height: params.height.filter(|&h| h > 0),
+        // FFmpeg's interlace_polarity with no container field order:
+        // bottom field first for the `MJPG` FourCC.
+        bottom_field_first: params.tag.as_ref() == Some(&CodecTag::fourcc(b"MJPG")),
         pending: None,
         last_output: None,
         eof: false,
@@ -326,11 +354,93 @@ struct MjpegDecoder {
     codec_id: CodecId,
     /// §B.5 tables-only stream shared by every packet (`extradata`).
     tables: Option<Vec<u8>>,
+    /// The container's picture height (FFmpeg's `orig_height`): an image
+    /// under 3/4 of it is one field of an interlaced frame.
+    container_height: Option<u32>,
+    /// Which field comes first in a packet of two.
+    bottom_field_first: bool,
     pending: Option<Packet>,
     /// Size and layout of the image `receive_frame` last returned
     /// (images are decoded there, so none is known before it).
     last_output: Option<(u32, u32, PixelFormat)>,
     eof: bool,
+}
+
+/// The length of the first JPEG image of `data`, through its EOI, walking
+/// the marker segments and skipping entropy-coded data (stuffed `FF 00`
+/// and restart markers belong to it).
+fn first_image_len(data: &[u8]) -> Option<usize> {
+    let be16 = |at: usize| {
+        data.get(at..at + 2)
+            .map(|b| usize::from(u16::from_be_bytes([b[0], b[1]])))
+    };
+    let mut i = data.windows(2).position(|w| w == [0xFF, 0xD8])? + 2;
+    while i + 1 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        match data[i + 1] {
+            0xD9 => return Some(i + 2),
+            0xFF => i += 1,
+            0x01 | 0xD0..=0xD8 => i += 2,
+            0xDA => {
+                i += 2 + be16(i + 2)?;
+                // Entropy-coded data runs to the next marker other than a
+                // stuffed byte or a restart.
+                while i + 1 < data.len()
+                    && (data[i] != 0xFF || matches!(data[i + 1], 0x00 | 0xD0..=0xD7 | 0xFF))
+                {
+                    i += 1;
+                }
+            }
+            _ => i += 2 + be16(i + 2)?,
+        }
+    }
+    None
+}
+
+/// One frame of two fields, as FFmpeg's decoder writes them: the first
+/// field's rows on the bottom (odd) lines when the bottom field comes
+/// first, else on the top (even) ones, and the second field on the rest.
+fn weave(
+    first: &crate::JpegImage,
+    second: &crate::JpegImage,
+    bottom_field_first: bool,
+) -> Result<crate::JpegImage> {
+    if (first.width, first.height, first.format) != (second.width, second.height, second.format)
+        || first.planes.len() != second.planes.len()
+    {
+        return Err(Error::invalid("MJPEG: the two fields of a frame differ"));
+    }
+    let (top, bottom) = if bottom_field_first {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    let planes = top
+        .planes
+        .iter()
+        .zip(&bottom.planes)
+        .map(|(t, b)| {
+            let rows = t.data.len() / t.stride.max(1);
+            let mut data = Vec::with_capacity(t.data.len() * 2);
+            for r in 0..rows {
+                data.extend_from_slice(&t.data[r * t.stride..(r + 1) * t.stride]);
+                data.extend_from_slice(&b.data[r * b.stride..(r + 1) * b.stride]);
+            }
+            crate::Plane {
+                stride: t.stride,
+                data,
+            }
+        })
+        .collect();
+    Ok(crate::JpegImage::new_unchecked(
+        first.width,
+        first.height * 2,
+        first.format,
+        planes,
+    ))
 }
 
 impl Decoder for MjpegDecoder {
@@ -364,7 +474,21 @@ impl Decoder for MjpegDecoder {
         if let Some(t) = &self.tables {
             opts = opts.with_tables(t.clone());
         }
-        let img = crate::decode_with(&pkt.data, &opts)?;
+        let mut img = crate::decode_with(&pkt.data, &opts)?;
+        // A field of an interlaced frame (FFmpeg's test in
+        // ff_mjpeg_decode_sof): the packet carries the second field after
+        // the first image.
+        if self
+            .container_height
+            .is_some_and(|h| u64::from(img.height) < u64::from(h) * 3 / 4)
+        {
+            // The second field starts at the next SOI: AVI1 pads the
+            // first field, and FFmpeg scans on to the next marker.
+            let after = first_image_len(&pkt.data).map(|n| &pkt.data[n..]).unwrap_or(&[]);
+            let rest = after.windows(2).position(|w| w == [0xFF, 0xD8]).map(|at| &after[at..]).unwrap_or(&[]);
+            let second = crate::decode_with(rest, &opts)?;
+            img = weave(&img, &second, self.bottom_field_first)?;
+        }
         self.last_output = Some((img.width, img.height, PixelFormat::from(img.format)));
         let mut vf = VideoFrame::from(img);
         vf.pts = pkt.pts;

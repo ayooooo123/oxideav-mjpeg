@@ -284,62 +284,62 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     (
         "baseline_yuv420_128x128_q75",
         0x72a63aef8358e8eb,
-        0x864ab298a0b5b2d2,
+        0x792d34ec6c7c12af,
     ),
     (
         "baseline_yuv422_64x64_q90",
         0x2413174c44a0171f,
-        0x9ee8968b742c44ae,
+        0xd1bf4f022d1641d3,
     ),
     (
         "baseline_yuv444_64x64_q50",
         0xa40afc212a838331,
-        0xb344767f4a9a2d57,
+        0x084146cb271c0cee,
     ),
     (
         "baseline_restart4_yuv420_64x64_q75",
         0x64c69156279fdabe,
-        0xb02337044fd1e222,
+        0xe9b239f509edd708,
     ),
     (
         "baseline_gray_64x64_q75",
         0x14feb0b3187f375a,
-        0x00c88553a43d8b92,
+        0x088f1f6c67396a1d,
     ),
     (
         "baseline_rgb24_64x64_q75",
         0x4f077d7971eb7490,
-        0xadbaacb18a10e44a,
+        0xc9c4373f51343610,
     ),
     (
         "baseline_cmyk_adobe0_64x64_q75",
         0x15d0d8cd11b98ab4,
-        0x6aeba4ca99a080a7,
+        0x412b899118369aa6,
     ),
     (
         "progressive_yuv420_128x128_q75",
         0x12c23b75bafd7d29,
-        0x864ab298a0b5b2d2,
+        0x792d34ec6c7c12af,
     ),
     (
         "progressive_sa_yuv420_64x64_q75",
         0xbd1608d1b757fa29,
-        0xb02337044fd1e222,
+        0xe9b239f509edd708,
     ),
     (
         "arith_yuv420_128x128_q75",
         0x1a32df2072bccf6c,
-        0x864ab298a0b5b2d2,
+        0x792d34ec6c7c12af,
     ),
     (
         "arith_gray_64x64_q75",
         0x25764fe17333ac20,
-        0x00c88553a43d8b92,
+        0x088f1f6c67396a1d,
     ),
     (
         "arith_rgb24_64x64_q75",
         0x0507a91012e698a5,
-        0xadbaacb18a10e44a,
+        0xc9c4373f51343610,
     ),
     (
         "lossless_gray8_pred1_128x128",
@@ -373,8 +373,8 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "hier_dct_yuv444_l2_64x64_q75",
-        0xfd1356bb4abc9f0d,
-        0x924b4b3ccf92818d,
+        0xc75338f3564e93c4,
+        0x73e05f367e3758d1,
     ),
 ];
 
