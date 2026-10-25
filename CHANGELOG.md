@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- SOF parsing rejects component sampling factors outside 1–4 (T.81 Table B.2). A factor of 0 reached `native_yuv_format` and panicked with a division by zero (fuzz finding, `standalone_api` target).
+
 ### Changed (PearTube fork)
 
 - Decoded frames equal FFmpeg 2da55bf's (`-idct simple`), frame for frame,
